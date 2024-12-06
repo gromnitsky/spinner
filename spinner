@@ -1,0 +1,116 @@
+#!/bin/sh
+# shellcheck disable=3043
+
+eh() { echo "spinner error: $*" 1>&2; exit 1; }
+uf() { echo "$1" | awk '{ print sqrt(($0+0)^2) }'; }
+cc() { for c; do command -v "$c" >/dev/null || eh no "$c"; done; }
+
+interval=0.2
+: "${SPINNER:=-\|/}"
+cc flock
+
+while getopts 'i:' o; do
+    [ "$o" = i ] && interval=`uf "$OPTARG"`
+done
+shift $((OPTIND-1))
+
+mode=${1:?Usage: spinner [-i float] \'start | stop | clean | wrap cmd ...\'}
+shift
+
+rundir=/tmp/$USER/sigwait.org/spinner/`ps -o tty= -p $$`
+
+spinner_draw_char() {
+    echo "$SPINNER" | awk -v i="$1" '{printf "%s\b", substr($0,i+1,1)}' 1>&2
+    sleep "$interval"
+}
+spinner_draw_end() { printf " \b" 1>&2; }
+
+async_start() {
+    echo READY > "$1" || return 1
+    rm "$1"
+
+    local i=-1
+    while true; do
+        [ -w "$1" ] && {
+            spinner_draw_end
+            echo STOP > "$1"; break
+        }
+        i=$(( (i + 1) % ${#SPINNER} ))
+        spinner_draw_char $i
+    done
+}
+
+read_reply() { IFS= read -r _ < "$1" > /dev/null; }
+
+start() {
+    local pipe
+    local lockfile="$1/lock"
+    pipe=`mktemp -u "$1/pipe.XXXXXXXXXX"`
+
+    mkfifo "$pipe" || return 1
+    async_start "$pipe" &
+    local pid=$!
+
+    echo "$pipe" > "$1/$pid"
+    echo "$pid" > "$lockfile"
+    read_reply "$pipe" || return 1
+}
+
+current_lock() { cat "$1/lock"; }
+
+stop() {
+    local pipe pid
+    pid=$1/`current_lock "$1"`
+    pipe=`cat "$pid"`
+
+    mkfifo "$pipe" || return 1
+    read_reply "$pipe"
+    rm "$pipe" "$pid"
+}
+
+wrap() {
+    ("$@") &
+    local pid=$!
+
+    local i=-1
+    while kill -0 $pid 2>/dev/null; do
+        i=$(( (i + 1) % ${#SPINNER} ))
+        spinner_draw_char $i
+    done
+    spinner_draw_end
+
+    wait $pid
+}
+
+lock() {
+    mkdir -p "$1"
+    exec 9<>"$1/lock"
+    flock -n 9
+}
+
+clean() {
+    local pid pipe
+    pid=`current_lock "$1"`
+    kill "$pid" 2>/dev/null
+    pid=$1/$pid
+    pipe=`cat "$pid" 2>/dev/null`
+    rm -f "$pid" "$pipe"
+}
+
+case $mode in
+    start)
+        [ -t 2 ] && lock "$rundir" || exit 2
+        start "$rundir"
+        ;;
+    stop)
+        [ -t 2 ] && [ "$1" = 0 ] || exit 2
+        stop "$rundir"
+        ;;
+    clean)
+        clean "$rundir" ;;
+    wrap)
+        { [ -t 2 ] && lock "$rundir"; } || exec "$@"
+        wrap "$@"
+        ;;
+    *) eh unknown mode
+esac
